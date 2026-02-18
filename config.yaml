@@ -1,0 +1,25 @@
+# Honest Broker Configuration
+# Remote MDA HB service connection details
+
+honest_broker:
+  # STS authentication endpoint
+  sts_host: "sts.example.com"        # e.g., "sts.mdanderson.org"
+
+  # DeIdentification API endpoint
+  api_host: "api.example.com"        # e.g., "hb-api.mdanderson.org"
+
+  # STS credentials
+  app_name: "MyApp"
+  app_key: "your-app-key-here"
+  username: "your-username"
+  password: "your-password"
+
+  # HTTP timeout in seconds
+  timeout: 30
+
+  # Token cache TTL in minutes (STS tokens typically expire in 60 min)
+  token_cache_minutes: 50
+
+  # Patient name format for de-identified data
+  # {id} is replaced with the de-identified patient ID from the HB service
+  patient_name_format: "Anonymous^{id}"
