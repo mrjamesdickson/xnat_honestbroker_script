@@ -322,6 +322,9 @@ def relabel_directory(input_dir: Path, output_dir: Path, client: HonestBrokerCli
         log.info("    -> New PatientID:   '%s' + '-' + '%s' = '%s'",
                  new_patient_name, hb_patient_id, combined_patient_id)
 
+        log.info("    PatientID:   '%s' -> '%s'", original_patient_id, combined_patient_id)
+        log.info("    PatientName: '%s' -> '%s'", original_patient_name, new_patient_name)
+
         if dry_run:
             log.info("    [DRY RUN] No changes written")
             summary["processed"] += 1
@@ -330,9 +333,6 @@ def relabel_directory(input_dir: Path, output_dir: Path, client: HonestBrokerCli
         # Apply relabeling
         ds.PatientID = combined_patient_id
         ds.PatientName = new_patient_name
-
-        log.info("    Changed PatientID:   '%s' -> '%s'", original_patient_id, ds.PatientID)
-        log.info("    Changed PatientName: '%s' -> '%s'", original_patient_name, str(ds.PatientName))
 
         # Write to output directory
         output_path.parent.mkdir(parents=True, exist_ok=True)
