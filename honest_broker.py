@@ -319,7 +319,7 @@ def relabel_directory(input_dir: Path, output_dir: Path, client: HonestBrokerCli
         if original_patient_name:
             log.info("    PatientName (0010,0010): lookup('%s') -> '%s'",
                      original_patient_name, new_patient_name)
-        log.info("    Combined PatientID: '%s-%s' = '%s'",
+        log.info("    -> New PatientID:   '%s' + '-' + '%s' = '%s'",
                  new_patient_name, hb_patient_id, combined_patient_id)
 
         if dry_run:
