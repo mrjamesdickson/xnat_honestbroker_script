@@ -253,9 +253,10 @@ class TestRelabelDirectory(TestCase):
             self.assertEqual(summary["skipped"], 0)
             self.assertEqual(len(summary["errors"]), 0)
 
-            # Verify both tags changed
+            # PatientID = "{name_lookup}-{id_lookup}"
+            # PatientName = name_lookup value
             output_ds = pydicom.dcmread(os.path.join(output_dir, "test.dcm"))
-            self.assertEqual(output_ds.PatientID, "DEIDENT-A1B2")
+            self.assertEqual(output_ds.PatientID, "ANON-NAME-001-DEIDENT-A1B2")
             self.assertEqual(str(output_ds.PatientName), "ANON-NAME-001")
 
     def test_tracks_both_id_and_name_mappings(self):
@@ -270,8 +271,10 @@ class TestRelabelDirectory(TestCase):
 
             summary = relabel_directory(Path(input_dir), Path(output_dir), client)
 
+            # PatientID mapping stores the combined value
             self.assertIn("ORIG123", summary["patient_id_mappings"])
-            self.assertEqual(summary["patient_id_mappings"]["ORIG123"], "DEIDENT-A1B2")
+            self.assertEqual(summary["patient_id_mappings"]["ORIG123"], "ANON-NAME-001-DEIDENT-A1B2")
+            # PatientName mapping stores the raw HB lookup result
             self.assertIn("Doe^John", summary["patient_name_mappings"])
             self.assertEqual(summary["patient_name_mappings"]["Doe^John"], "ANON-NAME-001")
 
@@ -384,7 +387,7 @@ class TestRelabelDirectory(TestCase):
             # All output files should have the same de-identified values
             for i in range(3):
                 ds = pydicom.dcmread(os.path.join(output_dir, f"img{i}.dcm"))
-                self.assertEqual(ds.PatientID, "DEIDENT-A1B2")
+                self.assertEqual(ds.PatientID, "ANON-NAME-001-DEIDENT-A1B2")
                 self.assertEqual(str(ds.PatientName), "ANON-NAME-001")
 
     def test_preserves_non_patient_tags(self):

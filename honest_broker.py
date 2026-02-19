@@ -230,7 +230,9 @@ def relabel_directory(input_dir: Path, output_dir: Path, client: HonestBrokerCli
     For each file:
       1. Reads PatientID (0010,0020) and PatientName (0010,0010)
       2. Calls HB lookup for each to get de-identified values
-      3. Replaces both tags and writes to output
+      3. Sets new PatientID = "{name_lookup}-{id_lookup}" (concatenated)
+      4. Sets new PatientName = name_lookup value
+      5. Writes to output preserving directory structure
 
     Returns a summary dict with counts, mappings, and any errors.
     """
@@ -272,9 +274,9 @@ def relabel_directory(input_dir: Path, output_dir: Path, client: HonestBrokerCli
             summary["skipped"] += 1
             continue
 
-        # Look up de-identified PatientID
+        # Look up de-identified PatientID via HB
         try:
-            new_patient_id = client.lookup(original_patient_id)
+            hb_patient_id = client.lookup(original_patient_id)
         except RuntimeError as e:
             log.error("HB lookup failed for PatientID in %s: %s", relative_path, e)
             summary["errors"].append({
@@ -302,17 +304,23 @@ def relabel_directory(input_dir: Path, output_dir: Path, client: HonestBrokerCli
                 summary["skipped"] += 1
                 continue
 
-        summary["patient_id_mappings"][original_patient_id] = new_patient_id
+        # Combine: new PatientID = "{name_lookup}-{id_lookup}"
+        # (matches MDA plugin's getExperimentLabel pattern)
+        combined_patient_id = f"{new_patient_name}-{hb_patient_id}" if new_patient_name else hb_patient_id
+
+        summary["patient_id_mappings"][original_patient_id] = combined_patient_id
         if original_patient_name:
             summary["patient_name_mappings"][original_patient_name] = new_patient_name
 
         # Show lookup details and changes
         log.info("  File: %s", relative_path)
         log.info("    PatientID   (0010,0020): lookup('%s') -> '%s'",
-                 original_patient_id, new_patient_id)
+                 original_patient_id, hb_patient_id)
         if original_patient_name:
             log.info("    PatientName (0010,0010): lookup('%s') -> '%s'",
                      original_patient_name, new_patient_name)
+        log.info("    Combined PatientID: '%s-%s' = '%s'",
+                 new_patient_name, hb_patient_id, combined_patient_id)
 
         if dry_run:
             log.info("    [DRY RUN] No changes written")
@@ -320,10 +328,10 @@ def relabel_directory(input_dir: Path, output_dir: Path, client: HonestBrokerCli
             continue
 
         # Apply relabeling
-        ds.PatientID = new_patient_id
+        ds.PatientID = combined_patient_id
         ds.PatientName = new_patient_name
 
-        log.info("    Changed PatientID:   '%s' -> '%s'", original_patient_id, new_patient_id)
+        log.info("    Changed PatientID:   '%s' -> '%s'", original_patient_id, combined_patient_id)
         log.info("    Changed PatientName: '%s' -> '%s'", original_patient_name, new_patient_name)
 
         # Write to output directory
