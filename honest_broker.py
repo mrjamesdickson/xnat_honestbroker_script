@@ -3,9 +3,15 @@
 Honest Broker DICOM Relabeling Script
 
 Reads DICOM files from an input directory, calls a remote MDA-style
-Honest Broker service to get de-identified Patient IDs, replaces
-PatientID and PatientName in the DICOM headers, and writes the
-modified files to an output directory preserving the directory structure.
+Honest Broker service to get de-identified PatientID and PatientName,
+replaces both in the DICOM headers, and writes the modified files to
+an output directory preserving the directory structure.
+
+Mirrors the logic from the MDA plugin (mdanderson_plugin):
+  - Authenticates via STS: POST https://{stsHost}/token
+  - Looks up PatientID: GET https://{apiHost}/DeIdentification/lookup?idIn={PatientID}
+  - Looks up PatientName: GET https://{apiHost}/DeIdentification/lookup?idIn={PatientName}
+  - Replaces both tags with the HB-returned de-identified values
 
 Usage:
     python honest_broker.py <input_dir> <output_dir> [--config config.yaml] [--dry-run]
@@ -38,7 +44,13 @@ log = logging.getLogger("honest_broker")
 
 
 class HonestBrokerClient:
-    """Client for the remote MDA-style Honest Broker de-identification service."""
+    """Client for the remote MDA-style Honest Broker de-identification service.
+
+    Mirrors HonestBrokerServiceImpl.java from mdanderson_plugin:
+      - auth() -> POST https://{stsHost}/token with JSON credentials
+      - lookup(idIn) -> GET https://{apiHost}/DeIdentification/lookup?idIn={idIn}
+      - Returns first result's idOut field
+    """
 
     def __init__(self, config: dict):
         self.sts_host = config["sts_host"]
@@ -49,7 +61,6 @@ class HonestBrokerClient:
         self.password = config["password"]
         self.timeout = config.get("timeout", 30)
         self.token_cache_minutes = config.get("token_cache_minutes", 50)
-        self.patient_name_format = config.get("patient_name_format", "Anonymous^{id}")
 
         self._token = None
         self._token_expires_at = 0
@@ -100,20 +111,23 @@ class HonestBrokerClient:
                  duration, self.token_cache_minutes)
         return token
 
-    def lookup(self, patient_id: str) -> str:
-        """Look up the de-identified ID for a given original patient ID.
+    def lookup(self, id_in: str) -> str:
+        """Look up the de-identified value for a given original identifier.
 
-        Returns the de-identified ID string, or raises on failure.
-        Results are cached per patient ID for the lifetime of this client.
+        This is a generic lookup - works for PatientID, PatientName, or any
+        identifier. Mirrors HonestBrokerServiceImpl.lookup(idin).
+
+        Returns the de-identified ID string (idOut), or raises on failure.
+        Results are cached per input value for the lifetime of this client.
         """
-        if patient_id in self._id_cache:
-            cached = self._id_cache[patient_id]
-            log.debug("Cache hit: %s -> %s", patient_id, cached)
+        if id_in in self._id_cache:
+            cached = self._id_cache[id_in]
+            log.debug("Cache hit: %s -> %s", id_in, cached)
             return cached
 
         token = self.authenticate()
 
-        encoded_id = urllib.parse.quote(patient_id, safe="")
+        encoded_id = urllib.parse.quote(id_in, safe="")
         api_url = f"https://{self.api_host}/DeIdentification/lookup?idIn={encoded_id}"
 
         log.debug("Calling HB API: GET %s", api_url)
@@ -131,35 +145,31 @@ class HonestBrokerClient:
             error_body = e.read().decode("utf-8", errors="replace") if e.fp else ""
             duration = time.time() - start
             log.error("HB lookup FAILED (%.1fs) for idIn=%s: HTTP %d: %s",
-                      duration, patient_id, e.code, error_body)
+                      duration, id_in, e.code, error_body)
             raise RuntimeError(
-                f"HB lookup failed for '{patient_id}': HTTP {e.code}: {error_body}"
+                f"HB lookup failed for '{id_in}': HTTP {e.code}: {error_body}"
             ) from e
         except Exception as e:
             duration = time.time() - start
-            log.error("HB lookup FAILED (%.1fs) for idIn=%s: %s", duration, patient_id, e)
-            raise RuntimeError(f"HB lookup failed for '{patient_id}': {e}") from e
+            log.error("HB lookup FAILED (%.1fs) for idIn=%s: %s", duration, id_in, e)
+            raise RuntimeError(f"HB lookup failed for '{id_in}': {e}") from e
 
         duration = time.time() - start
 
         results = json.loads(body)
         if not results or not isinstance(results, list) or len(results) == 0:
-            log.error("HB lookup returned empty results (%.1fs) for idIn=%s", duration, patient_id)
-            raise RuntimeError(f"HB lookup returned no results for '{patient_id}'")
+            log.error("HB lookup returned empty results (%.1fs) for idIn=%s", duration, id_in)
+            raise RuntimeError(f"HB lookup returned no results for '{id_in}'")
 
         id_out = results[0].get("idOut")
         if not id_out:
             log.error("HB lookup result missing 'idOut' (%.1fs) for idIn=%s: %s",
-                      duration, patient_id, results[0])
-            raise RuntimeError(f"HB lookup result missing 'idOut' for '{patient_id}'")
+                      duration, id_in, results[0])
+            raise RuntimeError(f"HB lookup result missing 'idOut' for '{id_in}'")
 
-        self._id_cache[patient_id] = id_out
-        log.info("HB lookup (%.1fs): %s -> %s", duration, patient_id, id_out)
+        self._id_cache[id_in] = id_out
+        log.info("HB lookup (%.1fs): %s -> %s", duration, id_in, id_out)
         return id_out
-
-    def format_patient_name(self, deidentified_id: str) -> str:
-        """Format the de-identified patient name using the configured template."""
-        return self.patient_name_format.format(id=deidentified_id)
 
 
 def find_dicom_files(input_dir: Path) -> list[Path]:
@@ -217,14 +227,20 @@ def relabel_directory(input_dir: Path, output_dir: Path, client: HonestBrokerCli
                       dry_run: bool = False) -> dict:
     """Process all DICOM files in input_dir and write relabeled copies to output_dir.
 
-    Returns a summary dict with counts and any errors.
+    For each file:
+      1. Reads PatientID (0010,0020) and PatientName (0010,0010)
+      2. Calls HB lookup for each to get de-identified values
+      3. Replaces both tags and writes to output
+
+    Returns a summary dict with counts, mappings, and any errors.
     """
     summary = {
         "total_files": 0,
         "processed": 0,
         "skipped": 0,
         "errors": [],
-        "patient_mappings": {},
+        "patient_id_mappings": {},
+        "patient_name_mappings": {},
     }
 
     dicom_files = find_dicom_files(input_dir)
@@ -248,37 +264,67 @@ def relabel_directory(input_dir: Path, output_dir: Path, client: HonestBrokerCli
             summary["skipped"] += 1
             continue
 
-        original_patient_id = getattr(ds, "PatientID", None)
+        original_patient_id = getattr(ds, "PatientID", None) or ""
+        original_patient_name = str(getattr(ds, "PatientName", None) or "")
+
         if not original_patient_id:
             log.warning("No PatientID in %s, skipping", relative_path)
             summary["skipped"] += 1
             continue
 
+        # Look up de-identified PatientID
         try:
-            deidentified_id = client.lookup(original_patient_id)
+            new_patient_id = client.lookup(original_patient_id)
         except RuntimeError as e:
-            log.error("HB lookup failed for %s (PatientID=%s): %s",
-                      relative_path, original_patient_id, e)
+            log.error("HB lookup failed for PatientID in %s: %s", relative_path, e)
             summary["errors"].append({
                 "file": str(relative_path),
-                "patient_id": original_patient_id,
+                "field": "PatientID",
+                "original": original_patient_id,
                 "error": str(e),
             })
             summary["skipped"] += 1
             continue
 
-        deidentified_name = client.format_patient_name(deidentified_id)
-        summary["patient_mappings"][original_patient_id] = deidentified_id
+        # Look up de-identified PatientName
+        new_patient_name = ""
+        if original_patient_name:
+            try:
+                new_patient_name = client.lookup(original_patient_name)
+            except RuntimeError as e:
+                log.error("HB lookup failed for PatientName in %s: %s", relative_path, e)
+                summary["errors"].append({
+                    "file": str(relative_path),
+                    "field": "PatientName",
+                    "original": original_patient_name,
+                    "error": str(e),
+                })
+                summary["skipped"] += 1
+                continue
+
+        summary["patient_id_mappings"][original_patient_id] = new_patient_id
+        if original_patient_name:
+            summary["patient_name_mappings"][original_patient_name] = new_patient_name
+
+        # Show lookup details and changes
+        log.info("  File: %s", relative_path)
+        log.info("    PatientID   (0010,0020): lookup('%s') -> '%s'",
+                 original_patient_id, new_patient_id)
+        if original_patient_name:
+            log.info("    PatientName (0010,0010): lookup('%s') -> '%s'",
+                     original_patient_name, new_patient_name)
 
         if dry_run:
-            log.info("[DRY RUN] %s: PatientID %s -> %s, PatientName -> %s",
-                     relative_path, original_patient_id, deidentified_id, deidentified_name)
+            log.info("    [DRY RUN] No changes written")
             summary["processed"] += 1
             continue
 
         # Apply relabeling
-        ds.PatientID = deidentified_id
-        ds.PatientName = deidentified_name
+        ds.PatientID = new_patient_id
+        ds.PatientName = new_patient_name
+
+        log.info("    Changed PatientID:   '%s' -> '%s'", original_patient_id, new_patient_id)
+        log.info("    Changed PatientName: '%s' -> '%s'", original_patient_name, new_patient_name)
 
         # Write to output directory
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -290,7 +336,7 @@ def relabel_directory(input_dir: Path, output_dir: Path, client: HonestBrokerCli
             summary["skipped"] += 1
             continue
 
-        log.debug("Wrote %s (PatientID: %s -> %s)", relative_path, original_patient_id, deidentified_id)
+        log.info("    Written to: %s", output_path)
         summary["processed"] += 1
 
     return summary
@@ -306,16 +352,26 @@ def print_summary(summary: dict) -> None:
     print(f"Skipped/errors:          {summary['skipped']}")
     print()
 
-    if summary["patient_mappings"]:
-        print("Patient ID Mappings:")
-        for original, deidentified in sorted(summary["patient_mappings"].items()):
-            print(f"  {original} -> {deidentified}")
+    if summary["patient_id_mappings"]:
+        print("PatientID Mappings (0010,0020):")
+        for original, deidentified in sorted(summary["patient_id_mappings"].items()):
+            print(f"  '{original}' -> '{deidentified}'")
+        print()
+
+    if summary["patient_name_mappings"]:
+        print("PatientName Mappings (0010,0010):")
+        for original, deidentified in sorted(summary["patient_name_mappings"].items()):
+            print(f"  '{original}' -> '{deidentified}'")
         print()
 
     if summary["errors"]:
         print(f"Errors ({len(summary['errors'])}):")
         for err in summary["errors"]:
-            print(f"  {err['file']}: {err['error']}")
+            parts = [err["file"]]
+            if "field" in err:
+                parts.append(f"{err['field']}='{err['original']}'")
+            parts.append(err["error"])
+            print(f"  {': '.join(parts)}")
         print()
 
     print("=" * 60)
